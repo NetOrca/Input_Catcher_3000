@@ -12,6 +12,13 @@ before it starts. See SYSTEM_keycast-product on Google Drive
 On launch: shows a small settings window (box color, text color, font),
 pre-filled with the last-saved choices if any. Clicking "Start Overlay"
 saves those choices next to the exe and starts the overlay immediately.
+
+v1.1 adds an optional Research mode (event log with ms timestamps,
+on-screen session clock, marker/record hotkeys, OBS websocket sync) --
+implemented in research.py, documented in RESEARCH_MODE.md. Off by
+default; the plain overlay is unchanged when it is off.
+
+`--no-gui` skips the settings screen and starts from the saved config.
 """
 
 import ctypes
@@ -24,6 +31,8 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog
 
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageTk
+
+import research  # research mode: event log, session clock, markers, OBS sync
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -51,6 +60,7 @@ DEFAULT_CONFIG = {
     "text_color": [255, 255, 255],
     "font_path": "",
 }
+DEFAULT_CONFIG.update(research.DEFAULTS)
 
 
 def load_config():
@@ -75,18 +85,30 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------- config --
-PANEL_H = 260
+BASE_PANEL_H = 260
+PANEL_H = BASE_PANEL_H
 LEFT_MARGIN = 40
 BOTTOM_MARGIN = 90
 ROW_H = 30
 FOCAL_Y = PANEL_H - 60
 MAX_ROWS = PANEL_H // ROW_H
+# Research mode adds a header band with the session clock above the key
+# log. HEADER_H is 0 in normal mode so the overlay is pixel-identical to
+# the plain streaming build.
+RESEARCH_HEADER_H = ROW_H + 6
+HEADER_H = 0
+RESEARCH = None  # research.ResearchSession when research mode is on
 HOLD_THRESHOLD = 0.30
 FADE_DURATION = 1.1
 FONT_SIZE = 22
 DEFAULT_FONT_PATHS = [r"C:\Windows\Fonts\consolab.ttf", r"C:\Windows\Fonts\arialbd.ttf"]
 TICK_MS = 33
+# Research mode redraws faster so the on-screen clock lags the log by at
+# most ~one 60 fps frame (the clock on any video frame is the render
+# time; log events carry the true time).
+RESEARCH_TICK_MS = 16
 HOLD_RGB = (255, 205, 90)
+WM_MOUSEMOVE = 0x0200
 TEXT_PAD_X = 18
 BOX_RADIUS = 14
 WIDEST_LABEL = "Backspace(hold)"
@@ -282,17 +304,24 @@ entries = []  # all entries still visible (held + fading out)
 
 
 def press(key_id, label):
+    """Returns True on a fresh press, False for Windows auto-repeat of a
+    key that is already down (those are not logged twice)."""
     if key_id in held:
-        return
-    e = {"label": label, "born": time.time(), "released": None}
+        return False
+    e = {"label": label, "born": time.time(), "released": None,
+         "t0": RESEARCH.clock.ms() if RESEARCH is not None else None}
     held[key_id] = e
     entries.append(e)
+    return True
 
 
 def release(key_id):
+    """Returns the research-clock time of the matching press (or None)."""
     e = held.pop(key_id, None)
     if e is not None:
         e["released"] = time.time()
+        return e.get("t0")
+    return None
 
 
 def tap(label):
@@ -306,32 +335,51 @@ def kb_hook(nCode, wParam, lParam):
         info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         extended = bool(info.flags & LLKHF_EXTENDED)
         name = vk_to_name(info.vkCode, info.scanCode, extended)
+        key_id = ("kb", info.vkCode)
         if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            press(("kb", info.vkCode), name)
+            label = name
+            if RESEARCH is not None and key_id not in held:
+                # Hotkeys show as MARK n / REC in the overlay but are still
+                # logged under their real key name, so the log stays a
+                # complete, consistent record of what was pressed.
+                if info.vkCode == RESEARCH.marker_vk:
+                    label = RESEARCH.marker()
+                elif info.vkCode == RESEARCH.record_vk:
+                    label = RESEARCH.record_toggle()
+            if press(key_id, label) and RESEARCH is not None:
+                RESEARCH.key_down(name, info.vkCode)
         elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-            release(("kb", info.vkCode))
+            t0 = release(key_id)
+            if RESEARCH is not None:
+                RESEARCH.key_up(name, info.vkCode, t0)
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
 
 def mouse_hook(nCode, wParam, lParam):
     if nCode >= 0:
         info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-        if wParam == WM_LBUTTONDOWN:
-            press(("m", "L"), "LMB")
-        elif wParam == WM_LBUTTONUP:
-            release(("m", "L"))
-        elif wParam == WM_RBUTTONDOWN:
-            press(("m", "R"), "RMB")
-        elif wParam == WM_RBUTTONUP:
-            release(("m", "R"))
-        elif wParam == WM_MBUTTONDOWN:
-            press(("m", "M"), "MMB")
-        elif wParam == WM_MBUTTONUP:
-            release(("m", "M"))
+        if wParam == WM_MOUSEMOVE:
+            if RESEARCH is not None:
+                RESEARCH.mouse_move(info.pt.x, info.pt.y)
+        elif wParam in _MOUSE_DOWN:
+            btn = _MOUSE_DOWN[wParam]
+            if press(("m", btn), btn + "MB") and RESEARCH is not None:
+                RESEARCH.button_down(btn + "MB")
+        elif wParam in _MOUSE_UP:
+            btn = _MOUSE_UP[wParam]
+            t0 = release(("m", btn))
+            if RESEARCH is not None:
+                RESEARCH.button_up(btn + "MB", t0)
         elif wParam == WM_MOUSEWHEEL:
             delta = ctypes.c_short(info.mouseData >> 16).value
             tap("Scroll Up" if delta > 0 else "Scroll Down")
+            if RESEARCH is not None:
+                RESEARCH.wheel(delta)
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+_MOUSE_DOWN = {WM_LBUTTONDOWN: "L", WM_RBUTTONDOWN: "R", WM_MBUTTONDOWN: "M"}
+_MOUSE_UP = {WM_LBUTTONUP: "L", WM_RBUTTONUP: "R", WM_MBUTTONUP: "M"}
 
 
 KB_PROC = HOOKPROC(kb_hook)
@@ -368,6 +416,26 @@ def draw_line(draw, text, y, rgba):
     draw.text((TEXT_PAD_X, y), text, font=FONT, fill=rgba)
 
 
+def draw_header(draw):
+    """Research mode: session clock (mm:ss.mmm) in a band at the top of
+    the panel, full opacity, plus a hairline under it. Reading this off
+    a video frame is what anchors the event log to the footage."""
+    draw_line(draw, RESEARCH.clock.fmt(), 3, FG_RGB + (255,))
+    y = HEADER_H - 2
+    draw.line((TEXT_PAD_X, y, PANEL_W - TEXT_PAD_X, y),
+              fill=FG_RGB + (110,), width=1)
+
+
+def apply_layout(research_on):
+    """Sets the panel geometry for normal vs research mode. Called once
+    before the overlay window is created (and by the settings preview)."""
+    global PANEL_H, FOCAL_Y, MAX_ROWS, HEADER_H
+    HEADER_H = RESEARCH_HEADER_H if research_on else 0
+    PANEL_H = BASE_PANEL_H + HEADER_H
+    FOCAL_Y = PANEL_H - 60
+    MAX_ROWS = (PANEL_H - HEADER_H) // ROW_H + 1
+
+
 def render_frame():
     global entries
     now = time.time()
@@ -379,9 +447,11 @@ def render_frame():
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle(
         (0, 0, PANEL_W - 1, PANEL_H - 1), radius=BOX_RADIUS, fill=BOX_FILL)
+    if RESEARCH is not None:
+        draw_header(draw)
     for i, e in enumerate(ordered):
         y = FOCAL_Y - i * ROW_H
-        if y < -ROW_H:
+        if y < HEADER_H:
             continue
         if e["released"] is None:
             is_hold = (now - e["born"]) >= HOLD_THRESHOLD
@@ -406,6 +476,12 @@ def render_preview_frame():
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle(
         (0, 0, PANEL_W - 1, PANEL_H - 1), radius=BOX_RADIUS, fill=BOX_FILL)
+    if HEADER_H:
+        draw_line(draw, "00:12.345", 3, FG_RGB + (255,))
+        y = HEADER_H - 2
+        draw.line((TEXT_PAD_X, y, PANEL_W - TEXT_PAD_X, y),
+                  fill=FG_RGB + (110,), width=1)
+        draw_line(draw, "MARK 3", FOCAL_Y - ROW_H * 2, HOLD_RGB + (255,))
     draw_line(draw, WIDEST_LABEL, FOCAL_Y, FG_RGB + (255,))
     draw_line(draw, "Space", FOCAL_Y - ROW_H, FG_RGB + (255,))
     return img
@@ -436,8 +512,14 @@ def make_dib(hdc):
 
 def wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_TIMER:
+        if RESEARCH is not None:
+            RESEARCH.tick()
         update_overlay(hwnd)
         return 0
+    if msg == research.WM_INPUT:
+        if RESEARCH is not None:
+            RESEARCH.raw_input(lparam)
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == WM_DESTROY:
         user32.PostQuitMessage(0)
         return 0
@@ -543,10 +625,13 @@ def close_existing_overlay():
     return len(seen)
 
 
-def main():
-    global screen_dc, mem_dc, dib_bits, dib_bmp, win_x, win_y
+def main(cfg=None):
+    global screen_dc, mem_dc, dib_bits, dib_bmp, win_x, win_y, RESEARCH
 
     close_existing_overlay()
+    cfg = cfg or {}
+    research_on = bool(cfg.get("research_mode"))
+    apply_layout(research_on)
 
     h_instance = kernel32.GetModuleHandleW(None)
     class_name = "Input_Catcher_3000_OverlayWnd"
@@ -576,7 +661,15 @@ def main():
     gdi32.SelectObject(mem_dc, dib_bmp)
 
     user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-    user32.SetTimer(hwnd, 1, TICK_MS, None)
+
+    if research_on:
+        # Session clock starts here, so t=0 in the log is the moment the
+        # overlay appeared; the on-screen clock shows the same value.
+        RESEARCH = research.ResearchSession(cfg, app_dir(), (screen_w, screen_h))
+        ok = research.register_raw_mouse(hwnd)
+        RESEARCH.log.write({"type": "raw_mouse_registered", "ok": bool(ok),
+                            "log_path": RESEARCH.log.path})
+    user32.SetTimer(hwnd, 1, RESEARCH_TICK_MS if research_on else TICK_MS, None)
 
     hook_kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, KB_PROC, h_instance, 0)
     hook_mouse = user32.SetWindowsHookExW(WH_MOUSE_LL, MOUSE_PROC, h_instance, 0)
@@ -588,6 +681,9 @@ def main():
 
     user32.UnhookWindowsHookEx(hook_kb)
     user32.UnhookWindowsHookEx(hook_mouse)
+    if RESEARCH is not None:
+        RESEARCH.close()
+        RESEARCH = None
 
 
 # ------------------------------------------------------------ settings UI --
@@ -609,10 +705,18 @@ def build_settings_gui(cfg):
     box_rgb = list(cfg["box_color"][:3])
     box_alpha = cfg["box_color"][3] if len(cfg["box_color"]) > 3 else 150
     text_rgb = list(cfg["text_color"])
-    state = {"font_path": cfg.get("font_path", ""), "started": False}
+    state = {"font_path": cfg.get("font_path", ""), "started": False,
+             "research_log_dir": cfg.get("research_log_dir", "")}
+    research_var = tk.BooleanVar(value=bool(cfg.get("research_mode")))
+    marker_var = tk.StringVar(value=cfg.get("marker_hotkey", "F8"))
+    record_var = tk.StringVar(value=cfg.get("record_hotkey", "F9"))
+    obs_var = tk.BooleanVar(value=bool(cfg.get("obs_sync")))
+    obs_port_var = tk.StringVar(value=str(cfg.get("obs_port", 4455)))
+    obs_pw_var = tk.StringVar(value=cfg.get("obs_password", ""))
 
     def refresh_preview():
         global FONT, PANEL_W, BOX_FILL, FG_RGB
+        apply_layout(research_var.get())
         FONT = load_font(state["font_path"])
         BOX_FILL = tuple(box_rgb) + (box_alpha,)
         FG_RGB = tuple(text_rgb)
@@ -718,10 +822,84 @@ def build_settings_gui(cfg):
         row=6, column=0, sticky="nw", pady=(14, 0))
     preview_label.grid(row=6, column=1, sticky="w", pady=(14, 0))
 
+    # ---- Research mode (off by default; the plain overlay is unchanged) --
+    def pick_log_dir():
+        path = filedialog.askdirectory(title="Choose log folder")
+        if path:
+            state["research_log_dir"] = path
+            log_dir_label.configure(text=path)
+
+    def test_obs_clicked():
+        obs_status_label.configure(text="Testing...")
+        result = {}
+
+        def worker():
+            result["text"] = research.obs_test(
+                cfg.get("obs_host", "127.0.0.1"), obs_port_var.get().strip() or "4455",
+                obs_pw_var.get())
+
+        def poll():
+            if "text" in result:
+                obs_status_label.configure(text=result["text"])
+            else:
+                root.after(100, poll)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+        root.after(100, poll)
+
+    def on_research_toggle():
+        st = "normal" if research_var.get() else "disabled"
+        for w in research_widgets:
+            w.configure(state=st)
+        refresh_preview()
+
+    rf = tk.LabelFrame(top, text=" Research mode ", bg="#1e1e1e", fg="#e8e8e8",
+                       font=("Segoe UI", 9, "bold"), padx=10, pady=6)
+    rf.grid(row=7, column=0, columnspan=2, sticky="we", pady=(14, 0))
+    CHK = {"bg": "#1e1e1e", "fg": "#e8e8e8", "selectcolor": "#3a3a3a",
+           "activebackground": "#1e1e1e", "activeforeground": "#e8e8e8",
+           "font": ("Segoe UI", 9)}
+    tk.Checkbutton(rf, text="Enable (event log + on-screen clock + markers)",
+                   variable=research_var, command=on_research_toggle,
+                   **CHK).grid(row=0, column=0, columnspan=3, sticky="w")
+    tk.Label(rf, text="Marker key:", **LBL).grid(row=1, column=0, sticky="w")
+    marker_menu = tk.OptionMenu(rf, marker_var, *research.FKEY_NAMES)
+    marker_menu.configure(width=4)
+    marker_menu.grid(row=1, column=1, sticky="w", pady=1)
+    tk.Label(rf, text="Record key:", **LBL).grid(row=2, column=0, sticky="w")
+    record_menu = tk.OptionMenu(rf, record_var, *research.FKEY_NAMES)
+    record_menu.configure(width=4)
+    record_menu.grid(row=2, column=1, sticky="w", pady=1)
+    tk.Label(rf, text="Log folder:", **LBL).grid(row=3, column=0, sticky="w")
+    log_dir_label = tk.Label(
+        rf, text=state["research_log_dir"] or "research_logs (next to the exe)",
+        **LBL)
+    log_dir_label.grid(row=3, column=1, sticky="w")
+    log_dir_btn = tk.Button(rf, text="Browse...", command=pick_log_dir)
+    log_dir_btn.grid(row=3, column=2, sticky="w", padx=(6, 0), pady=1)
+    obs_chk = tk.Checkbutton(
+        rf, text="OBS sync (stamp OBS record time on markers; record key toggles recording)",
+        variable=obs_var, **CHK)
+    obs_chk.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    tk.Label(rf, text="OBS port:", **LBL).grid(row=5, column=0, sticky="w")
+    obs_port_entry = tk.Entry(rf, textvariable=obs_port_var, width=8)
+    obs_port_entry.grid(row=5, column=1, sticky="w", pady=1)
+    tk.Label(rf, text="OBS password:", **LBL).grid(row=6, column=0, sticky="w")
+    obs_pw_entry = tk.Entry(rf, textvariable=obs_pw_var, width=22, show="*")
+    obs_pw_entry.grid(row=6, column=1, sticky="w", pady=1)
+    obs_test_btn = tk.Button(rf, text="Test OBS", command=test_obs_clicked)
+    obs_test_btn.grid(row=6, column=2, sticky="w", padx=(6, 0))
+    obs_status_label = tk.Label(rf, text="", **LBL)
+    obs_status_label.grid(row=7, column=0, columnspan=3, sticky="w")
+    research_widgets = [marker_menu, record_menu, log_dir_btn, obs_chk,
+                        obs_port_entry, obs_pw_entry, obs_test_btn]
+    on_research_toggle()
+
     tk.Button(top, text="Start Overlay", font=("Segoe UI", 10, "bold"),
               bg="#2d7d46", fg="white", activebackground="#358a4f",
               command=start_clicked).grid(
-        row=7, column=0, columnspan=2, pady=(18, 0), sticky="we")
+        row=8, column=0, columnspan=2, pady=(18, 0), sticky="we")
 
     # Manual escape hatch: normally Start Overlay closes any leftover
     # instance on its own, but this gives a visible, no-questions-asked
@@ -730,9 +908,9 @@ def build_settings_gui(cfg):
     # ever touching Task Manager.
     tk.Button(top, text="Close All Instances", font=("Segoe UI", 9),
               command=close_all_clicked).grid(
-        row=8, column=0, columnspan=2, pady=(8, 0), sticky="we")
+        row=9, column=0, columnspan=2, pady=(8, 0), sticky="we")
     close_status_label = tk.Label(top, text="", **LBL)
-    close_status_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    close_status_label.grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     refresh_preview()
     root.mainloop()
@@ -740,11 +918,24 @@ def build_settings_gui(cfg):
     if not state["started"]:
         return None
 
-    return {
+    try:
+        obs_port = int(obs_port_var.get().strip() or 4455)
+    except ValueError:
+        obs_port = 4455
+    out = dict(cfg)  # keep any keys the UI doesn't expose (obs_host, prefix...)
+    out.update({
         "box_color": box_rgb + [box_alpha],
         "text_color": text_rgb,
         "font_path": state["font_path"],
-    }
+        "research_mode": bool(research_var.get()),
+        "research_log_dir": state["research_log_dir"],
+        "marker_hotkey": marker_var.get(),
+        "record_hotkey": record_var.get(),
+        "obs_sync": bool(obs_var.get()),
+        "obs_port": obs_port,
+        "obs_password": obs_pw_var.get(),
+    })
+    return out
 
 
 # ------------------------------------------------------------------ entry --
@@ -758,14 +949,21 @@ if __name__ == "__main__":
     close_existing_overlay()
 
     saved_cfg = load_config()
-    result_cfg = build_settings_gui(saved_cfg)
-    if result_cfg is None:
-        sys.exit(0)
-    save_config(result_cfg)
+    if "--no-gui" in sys.argv:
+        # Skip the settings screen and start straight from the saved
+        # config -- for shortcuts/scripts that launch it alongside OBS,
+        # and for automated testing of research mode.
+        result_cfg = saved_cfg
+    else:
+        result_cfg = build_settings_gui(saved_cfg)
+        if result_cfg is None:
+            sys.exit(0)
+        save_config(result_cfg)
 
+    apply_layout(bool(result_cfg.get("research_mode")))
     FONT = load_font(result_cfg.get("font_path", ""))
     BOX_FILL = tuple(result_cfg["box_color"])
     FG_RGB = tuple(result_cfg["text_color"])
     PANEL_W = compute_panel_width()
 
-    main()
+    main(result_cfg)

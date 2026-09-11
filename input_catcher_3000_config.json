@@ -10,5 +10,7 @@
     255,
     255
   ],
-  "font_path": ""
+  "font_path": "",
+  "obs_port": 4455,
+  "obs_password": ""
 }

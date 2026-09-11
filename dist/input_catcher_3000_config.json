@@ -10,5 +10,8 @@
     255,
     255
   ],
-  "font_path": ""
+  "font_path": "",
+  "research_mode": false,
+  "obs_sync": false,
+  "obs_password": ""
 }

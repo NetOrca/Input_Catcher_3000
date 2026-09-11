@@ -1,3 +1,7 @@
 build/
 __pycache__/
 *.pyc
+
+research_logs/
+config_backup.json
+test_stderr.txt
