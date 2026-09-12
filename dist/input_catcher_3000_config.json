@@ -17,7 +17,7 @@
   "record_hotkey": "F9",
   "marker_prefix": "trial",
   "mouse_sample_hz": 60,
-  "obs_sync": false,
+  "obs_sync": true,
   "obs_host": "127.0.0.1",
   "obs_port": 4455,
   "obs_password": "0K26ZUyjpVHYulnK"

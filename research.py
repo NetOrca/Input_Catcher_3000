@@ -38,7 +38,7 @@ import threading
 import time
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"  # keep in step with version_info.txt (the exe's Properties tab)
 
 DEFAULTS = {
     "research_mode": False,

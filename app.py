@@ -592,7 +592,8 @@ def update_overlay(hwnd):
     )
 
 
-SETTINGS_TITLE = "Input_Catcher_3000 Settings"
+SETTINGS_TITLE_BASE = "Input_Catcher_3000 Settings"
+SETTINGS_TITLE = "%s  v%s" % (SETTINGS_TITLE_BASE, research.VERSION)
 OVERLAY_CLASS = "Input_Catcher_3000_OverlayWnd"
 
 
@@ -624,7 +625,9 @@ def _find_other_instance_windows():
             if title_len > 0:
                 title_buf = ctypes.create_unicode_buffer(title_len + 1)
                 user32.GetWindowTextW(hwnd, title_buf, title_len + 1)
-                is_match = title_buf.value == SETTINGS_TITLE
+                # Prefix match so an older build's settings window (no
+                # version suffix, or a different one) is still caught.
+                is_match = title_buf.value.startswith(SETTINGS_TITLE_BASE)
         if is_match:
             found.append(hwnd)
         return True
@@ -802,7 +805,7 @@ def build_settings_gui(cfg):
     global FONT, PANEL_W, BOX_FILL, FG_RGB
 
     root = tk.Tk()
-    root.title("Input_Catcher_3000 Settings")
+    root.title(SETTINGS_TITLE)
     root.resizable(False, False)
     root.configure(bg="#1e1e1e")
 
