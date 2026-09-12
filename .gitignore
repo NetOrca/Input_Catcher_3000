@@ -5,3 +5,6 @@ __pycache__/
 research_logs/
 config_backup.json
 test_stderr.txt
+models/
+input_catcher_3000_config.json
+dist/Input_Catcher_3000.exe

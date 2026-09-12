@@ -33,6 +33,7 @@ from tkinter import colorchooser, filedialog
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageTk
 
 import research  # research mode: event log, session clock, markers, OBS sync
+import voice     # voice mode: talk, transcribe locally, type into the Claude app
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -61,6 +62,7 @@ DEFAULT_CONFIG = {
     "font_path": "",
 }
 DEFAULT_CONFIG.update(research.DEFAULTS)
+DEFAULT_CONFIG.update(voice.VOICE_DEFAULTS)
 
 
 def load_config():
@@ -104,6 +106,14 @@ HEADER_HINT = ""
 HINT_FONT_SIZE = 14
 HINT_GAP = 12
 SMALL_FONT = None
+# Voice mode adds a footer band at the bottom: "F7 voice" when idle, a
+# red "F7 send  0:04" readout while the mic is open.
+VOICE_FOOTER_H = ROW_H + 4
+FOOTER_H = 0
+VOICE = None          # voice.VoiceSession when voice mode is on
+VOICE_HOTKEY = "F7"
+VOICE_VK = 0x76
+LIVE_RGB = (255, 90, 90)
 HOLD_THRESHOLD = 0.30
 FADE_DURATION = 1.1
 FONT_SIZE = 22
@@ -339,12 +349,19 @@ def tap(label):
 def kb_hook(nCode, wParam, lParam):
     if nCode >= 0:
         info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+        if info.dwExtraInfo == voice.INJECT_MAGIC:
+            # Our own Ctrl+V / Enter / Alt taps while delivering a voice
+            # message -- not the user's keystrokes, keep them out of the
+            # overlay and the log.
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
         extended = bool(info.flags & LLKHF_EXTENDED)
         name = vk_to_name(info.vkCode, info.scanCode, extended)
         key_id = ("kb", info.vkCode)
         if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
             label = name
-            if RESEARCH is not None and key_id not in held:
+            if VOICE is not None and key_id not in held and info.vkCode == VOICE_VK:
+                label = VOICE.toggle()
+            elif RESEARCH is not None and key_id not in held:
                 # Hotkeys show as MARK n / REC in the overlay but are still
                 # logged under their real key name, so the log stays a
                 # complete, consistent record of what was pressed.
@@ -464,16 +481,43 @@ def apply_layout(research_on, cfg=None):
     before the overlay window is created (and by the settings preview).
     cfg supplies the hotkey names + font for the header hint."""
     global PANEL_H, FOCAL_Y, MAX_ROWS, HEADER_H, HEADER_HINT, SMALL_FONT
+    global FOOTER_H, VOICE_HOTKEY, VOICE_VK
+    cfg = cfg or {}
+    voice_on = bool(cfg.get("voice_mode"))
     HEADER_H = RESEARCH_HEADER_H if research_on else 0
-    PANEL_H = BASE_PANEL_H + HEADER_H
-    FOCAL_Y = PANEL_H - 60
-    MAX_ROWS = (PANEL_H - HEADER_H) // ROW_H + 1
-    if research_on and cfg is not None:
-        HEADER_HINT = make_header_hint(cfg)
+    FOOTER_H = VOICE_FOOTER_H if voice_on else 0
+    PANEL_H = BASE_PANEL_H + HEADER_H + FOOTER_H
+    FOCAL_Y = PANEL_H - 60 - FOOTER_H
+    MAX_ROWS = (PANEL_H - HEADER_H - FOOTER_H) // ROW_H + 1
+    HEADER_HINT = make_header_hint(cfg) if research_on else ""
+    VOICE_HOTKEY = cfg.get("voice_hotkey", "F7")
+    VOICE_VK = research.FKEY_VK.get(VOICE_HOTKEY, 0x76)
+    if research_on or voice_on:
         SMALL_FONT = load_font(cfg.get("font_path", ""), HINT_FONT_SIZE)
     else:
-        HEADER_HINT = ""
         SMALL_FONT = None
+
+
+def draw_footer_band(draw, text, style):
+    """Voice mode: hairline + one small line at the bottom of the panel.
+    style 'idle' = dim key reminder, 'live' = red dot + red text while
+    the mic is open, 'note' = gold status (sent / error)."""
+    top = PANEL_H - FOOTER_H
+    draw.line((TEXT_PAD_X, top + 1, PANEL_W - TEXT_PAD_X, top + 1),
+              fill=FG_RGB + (110,), width=1)
+    y = top + 6
+    x = TEXT_PAD_X
+    if style == "live":
+        r = 5
+        cy = y + HINT_FONT_SIZE // 2 + 1
+        draw.ellipse((x, cy - r, x + 2 * r, cy + r), fill=LIVE_RGB + (255,))
+        x += 2 * r + 8
+        rgba = LIVE_RGB + (255,)
+    elif style == "note":
+        rgba = HOLD_RGB + (255,)
+    else:
+        rgba = FG_RGB + (200,)
+    draw.text((x, y), text, font=SMALL_FONT, fill=rgba)
 
 
 def render_frame():
@@ -489,6 +533,8 @@ def render_frame():
         (0, 0, PANEL_W - 1, PANEL_H - 1), radius=BOX_RADIUS, fill=BOX_FILL)
     if RESEARCH is not None:
         draw_header(draw)
+    if VOICE is not None:
+        draw_footer_band(draw, *VOICE.footer_text(VOICE_HOTKEY))
     for i, e in enumerate(ordered):
         y = FOCAL_Y - i * ROW_H
         if y < HEADER_H:
@@ -519,6 +565,8 @@ def render_preview_frame():
     if HEADER_H:
         draw_header_band(draw, "00:12.345")
         draw_line(draw, "MARK 3", FOCAL_Y - ROW_H * 2, HOLD_RGB + (255,))
+    if FOOTER_H:
+        draw_footer_band(draw, "%s voice" % VOICE_HOTKEY, "idle")
     draw_line(draw, WIDEST_LABEL, FOCAL_Y, FG_RGB + (255,))
     draw_line(draw, "Space", FOCAL_Y - ROW_H, FG_RGB + (255,))
     return img
@@ -666,7 +714,7 @@ def close_existing_overlay():
 
 
 def main(cfg=None):
-    global screen_dc, mem_dc, dib_bits, dib_bmp, win_x, win_y, RESEARCH
+    global screen_dc, mem_dc, dib_bits, dib_bmp, win_x, win_y, RESEARCH, VOICE
 
     close_existing_overlay()
     cfg = cfg or {}
@@ -709,7 +757,12 @@ def main(cfg=None):
         ok = research.register_raw_mouse(hwnd)
         RESEARCH.log.write({"type": "raw_mouse_registered", "ok": bool(ok),
                             "log_path": RESEARCH.log.path})
-    user32.SetTimer(hwnd, 1, RESEARCH_TICK_MS if research_on else TICK_MS, None)
+    if cfg.get("voice_mode"):
+        VOICE = voice.VoiceSession(
+            cfg, app_dir(),
+            on_event=lambda rec: RESEARCH.log.write(rec) if RESEARCH is not None else None)
+    fast = research_on or VOICE is not None
+    user32.SetTimer(hwnd, 1, RESEARCH_TICK_MS if fast else TICK_MS, None)
 
     hook_kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, KB_PROC, h_instance, 0)
     hook_mouse = user32.SetWindowsHookExW(WH_MOUSE_LL, MOUSE_PROC, h_instance, 0)
@@ -721,6 +774,9 @@ def main(cfg=None):
 
     user32.UnhookWindowsHookEx(hook_kb)
     user32.UnhookWindowsHookEx(hook_mouse)
+    if VOICE is not None:
+        VOICE.close()
+        VOICE = None
     if RESEARCH is not None:
         RESEARCH.close()
         RESEARCH = None
@@ -796,6 +852,11 @@ RECORD_TIP = ("Record key. Starts or stops OBS recording without switching "
               "to OBS, and logs when it happened. Needs OBS sync turned on "
               "and a working Test OBS; without that, pressing it just logs "
               "a note.")
+VOICE_TIP = ("Voice key. Press once to start listening (the footer turns "
+             "red), say your message, press again to send. Speech is turned "
+             "into text on this PC, then pasted into the Claude app window "
+             "and sent with Enter. Focus goes back to what you were doing. "
+             "First use downloads a ~150 MB speech model.")
 
 
 def build_settings_gui(cfg):
@@ -820,6 +881,10 @@ def build_settings_gui(cfg):
     obs_var = tk.BooleanVar(value=bool(cfg.get("obs_sync")))
     obs_port_var = tk.StringVar(value=str(cfg.get("obs_port", 4455)))
     obs_pw_var = tk.StringVar(value=cfg.get("obs_password", ""))
+    voice_var = tk.BooleanVar(value=bool(cfg.get("voice_mode")))
+    voice_key_var = tk.StringVar(value=cfg.get("voice_hotkey", "F7"))
+    voice_enter_var = tk.BooleanVar(value=bool(cfg.get("voice_send_enter", True)))
+    voice_title_var = tk.StringVar(value=cfg.get("voice_target_title", "Claude"))
 
     def refresh_preview():
         global FONT, PANEL_W, BOX_FILL, FG_RGB
@@ -828,6 +893,8 @@ def build_settings_gui(cfg):
             "marker_hotkey": marker_var.get(),
             "record_hotkey": record_var.get(),
             "obs_sync": obs_var.get(),
+            "voice_mode": voice_var.get(),
+            "voice_hotkey": voice_key_var.get(),
         })
         FONT = load_font(state["font_path"])
         BOX_FILL = tuple(box_rgb) + (box_alpha,)
@@ -1024,10 +1091,41 @@ def build_settings_gui(cfg):
                         obs_port_entry, obs_pw_entry, obs_test_btn]
     on_research_toggle()
 
+    # ---- Voice to Claude -------------------------------------------------
+    def on_voice_toggle():
+        st = "normal" if voice_var.get() else "disabled"
+        for w in voice_widgets:
+            w.configure(state=st)
+        refresh_preview()
+
+    vf = tk.LabelFrame(top, text=" Voice to Claude ", bg="#1e1e1e", fg="#e8e8e8",
+                       font=("Segoe UI", 9, "bold"), padx=10, pady=6)
+    vf.grid(row=8, column=0, columnspan=2, sticky="we", pady=(10, 0))
+    tk.Checkbutton(vf, text="Enable (press the voice key, talk, press it again to send)",
+                   variable=voice_var, command=on_voice_toggle,
+                   **CHK).grid(row=0, column=0, columnspan=3, sticky="w")
+    tk.Label(vf, text="Voice key:", **LBL).grid(row=1, column=0, sticky="w")
+    voice_row = tk.Frame(vf, bg="#1e1e1e")
+    voice_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=1)
+    voice_menu = tk.OptionMenu(voice_row, voice_key_var, *research.FKEY_NAMES)
+    voice_menu.configure(width=4)
+    voice_menu.pack(side="left")
+    info_icon(voice_row, VOICE_TIP).pack(side="left", padx=(6, 0))
+    tk.Label(vf, text="Send to window:", **LBL).grid(row=2, column=0, sticky="w")
+    voice_title_entry = tk.Entry(vf, textvariable=voice_title_var, width=22)
+    voice_title_entry.grid(row=2, column=1, sticky="w", pady=1)
+    voice_enter_chk = tk.Checkbutton(
+        vf, text="Press Enter to send (untick to just type it in)",
+        variable=voice_enter_var, **CHK)
+    voice_enter_chk.grid(row=3, column=0, columnspan=3, sticky="w")
+    voice_widgets = [voice_menu, voice_title_entry, voice_enter_chk]
+    voice_key_var.trace_add("write", lambda *_: refresh_preview())
+    on_voice_toggle()
+
     tk.Button(top, text="Start Overlay", font=("Segoe UI", 10, "bold"),
               bg="#2d7d46", fg="white", activebackground="#358a4f",
               command=start_clicked).grid(
-        row=8, column=0, columnspan=2, pady=(18, 0), sticky="we")
+        row=9, column=0, columnspan=2, pady=(18, 0), sticky="we")
 
     # Manual escape hatch: normally Start Overlay closes any leftover
     # instance on its own, but this gives a visible, no-questions-asked
@@ -1036,9 +1134,9 @@ def build_settings_gui(cfg):
     # ever touching Task Manager.
     tk.Button(top, text="Close All Instances", font=("Segoe UI", 9),
               command=close_all_clicked).grid(
-        row=9, column=0, columnspan=2, pady=(8, 0), sticky="we")
+        row=10, column=0, columnspan=2, pady=(8, 0), sticky="we")
     close_status_label = tk.Label(top, text="", **LBL)
-    close_status_label.grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    close_status_label.grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     refresh_preview()
     root.mainloop()
@@ -1062,6 +1160,10 @@ def build_settings_gui(cfg):
         "obs_sync": bool(obs_var.get()),
         "obs_port": obs_port,
         "obs_password": obs_pw_var.get(),
+        "voice_mode": bool(voice_var.get()),
+        "voice_hotkey": voice_key_var.get(),
+        "voice_send_enter": bool(voice_enter_var.get()),
+        "voice_target_title": voice_title_var.get().strip() or "Claude",
     })
     return out
 
