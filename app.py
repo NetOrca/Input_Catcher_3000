@@ -98,6 +98,12 @@ MAX_ROWS = PANEL_H // ROW_H
 RESEARCH_HEADER_H = ROW_H + 6
 HEADER_H = 0
 RESEARCH = None  # research.ResearchSession when research mode is on
+# Small reminder drawn to the right of the clock, e.g. "F8 mark  F9 rec",
+# so the user never has to open settings to remember their hotkeys.
+HEADER_HINT = ""
+HINT_FONT_SIZE = 14
+HINT_GAP = 12
+SMALL_FONT = None
 HOLD_THRESHOLD = 0.30
 FADE_DURATION = 1.1
 FONT_SIZE = 22
@@ -387,18 +393,28 @@ MOUSE_PROC = HOOKPROC(mouse_hook)
 
 
 # ------------------------------------------------------------- rendering --
-def load_font(custom_path=""):
+def load_font(custom_path="", size=None):
+    size = size or FONT_SIZE
     if custom_path:
         try:
-            return ImageFont.truetype(custom_path, FONT_SIZE)
+            return ImageFont.truetype(custom_path, size)
         except OSError:
             pass  # fall through to the built-in defaults below
     for p in DEFAULT_FONT_PATHS:
         try:
-            return ImageFont.truetype(p, FONT_SIZE)
+            return ImageFont.truetype(p, size)
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+def make_header_hint(cfg):
+    """'F8 mark  F9 rec' -- the record half only when OBS sync is on,
+    since F9 does nothing useful without it."""
+    hint = "%s mark" % cfg.get("marker_hotkey", "F8")
+    if cfg.get("obs_sync"):
+        hint += "  %s rec" % cfg.get("record_hotkey", "F9")
+    return hint
 
 
 def compute_panel_width():
@@ -409,6 +425,13 @@ def compute_panel_width():
     d = ImageDraw.Draw(dummy)
     bbox = d.textbbox((0, 0), WIDEST_LABEL, font=FONT)
     text_w = bbox[2] - bbox[0]
+    if HEADER_H and HEADER_HINT and SMALL_FONT is not None:
+        # Research header: clock + hotkey hint on one line may be wider
+        # than the widest key label; the panel grows to fit.
+        cb = d.textbbox((0, 0), "00:00.000", font=FONT)
+        hb = d.textbbox((0, 0), HEADER_HINT, font=SMALL_FONT)
+        header_w = (cb[2] - cb[0]) + HINT_GAP + (hb[2] - hb[0])
+        text_w = max(text_w, header_w)
     return text_w + TEXT_PAD_X * 2
 
 
@@ -416,24 +439,41 @@ def draw_line(draw, text, y, rgba):
     draw.text((TEXT_PAD_X, y), text, font=FONT, fill=rgba)
 
 
-def draw_header(draw):
-    """Research mode: session clock (mm:ss.mmm) in a band at the top of
-    the panel, full opacity, plus a hairline under it. Reading this off
-    a video frame is what anchors the event log to the footage."""
-    draw_line(draw, RESEARCH.clock.fmt(), 3, FG_RGB + (255,))
+def draw_header_band(draw, clock_text):
+    """Research mode: session clock (mm:ss.mmm) at the top of the panel,
+    full opacity, the hotkey hint in a smaller face to its right, and a
+    hairline under both. Reading the clock off a video frame is what
+    anchors the event log to the footage."""
+    draw_line(draw, clock_text, 3, FG_RGB + (255,))
+    if HEADER_HINT and SMALL_FONT is not None:
+        cb = draw.textbbox((TEXT_PAD_X, 3), clock_text, font=FONT)
+        x = cb[2] + HINT_GAP
+        y = 3 + (FONT_SIZE - HINT_FONT_SIZE) // 2 + 2
+        draw.text((x, y), HEADER_HINT, font=SMALL_FONT, fill=FG_RGB + (200,))
     y = HEADER_H - 2
     draw.line((TEXT_PAD_X, y, PANEL_W - TEXT_PAD_X, y),
               fill=FG_RGB + (110,), width=1)
 
 
-def apply_layout(research_on):
+def draw_header(draw):
+    draw_header_band(draw, RESEARCH.clock.fmt())
+
+
+def apply_layout(research_on, cfg=None):
     """Sets the panel geometry for normal vs research mode. Called once
-    before the overlay window is created (and by the settings preview)."""
-    global PANEL_H, FOCAL_Y, MAX_ROWS, HEADER_H
+    before the overlay window is created (and by the settings preview).
+    cfg supplies the hotkey names + font for the header hint."""
+    global PANEL_H, FOCAL_Y, MAX_ROWS, HEADER_H, HEADER_HINT, SMALL_FONT
     HEADER_H = RESEARCH_HEADER_H if research_on else 0
     PANEL_H = BASE_PANEL_H + HEADER_H
     FOCAL_Y = PANEL_H - 60
     MAX_ROWS = (PANEL_H - HEADER_H) // ROW_H + 1
+    if research_on and cfg is not None:
+        HEADER_HINT = make_header_hint(cfg)
+        SMALL_FONT = load_font(cfg.get("font_path", ""), HINT_FONT_SIZE)
+    else:
+        HEADER_HINT = ""
+        SMALL_FONT = None
 
 
 def render_frame():
@@ -477,10 +517,7 @@ def render_preview_frame():
     draw.rounded_rectangle(
         (0, 0, PANEL_W - 1, PANEL_H - 1), radius=BOX_RADIUS, fill=BOX_FILL)
     if HEADER_H:
-        draw_line(draw, "00:12.345", 3, FG_RGB + (255,))
-        y = HEADER_H - 2
-        draw.line((TEXT_PAD_X, y, PANEL_W - TEXT_PAD_X, y),
-                  fill=FG_RGB + (110,), width=1)
+        draw_header_band(draw, "00:12.345")
         draw_line(draw, "MARK 3", FOCAL_Y - ROW_H * 2, HOLD_RGB + (255,))
     draw_line(draw, WIDEST_LABEL, FOCAL_Y, FG_RGB + (255,))
     draw_line(draw, "Space", FOCAL_Y - ROW_H, FG_RGB + (255,))
@@ -631,7 +668,7 @@ def main(cfg=None):
     close_existing_overlay()
     cfg = cfg or {}
     research_on = bool(cfg.get("research_mode"))
-    apply_layout(research_on)
+    apply_layout(research_on, cfg)
 
     h_instance = kernel32.GetModuleHandleW(None)
     class_name = "Input_Catcher_3000_OverlayWnd"
@@ -691,6 +728,73 @@ def _rgb_to_hex(rgb):
     return "#%02x%02x%02x" % tuple(int(c) for c in rgb)
 
 
+class Tooltip:
+    """Hover tooltip for any tk widget (tkinter has no built-in one).
+    Shows after a short delay, hides on leave."""
+
+    def __init__(self, widget, text, delay_ms=350):
+        self.widget, self.text, self.delay = widget, text, delay_ms
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            self.widget.after_cancel(self._after)
+            self._after = None
+
+    def _show(self):
+        if self._tip is not None:
+            return
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 8
+        y = self.widget.winfo_rooty() - 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_attributes("-topmost", True)
+        self._tip.wm_geometry("+%d+%d" % (x, y))
+        tk.Label(self._tip, text=self.text, justify="left", wraplength=300,
+                 bg="#2b2b2b", fg="#f0f0f0", font=("Segoe UI", 9),
+                 relief="solid", bd=1, padx=8, pady=6,
+                 highlightthickness=0).pack()
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+def info_icon(parent, text):
+    """A small gold 'i' badge on a gray disc that shows `text` on hover.
+    Drawn on a Canvas so it looks the same on every Windows theme."""
+    size = 18
+    c = tk.Canvas(parent, width=size, height=size, bg="#1e1e1e",
+                  highlightthickness=0, cursor="question_arrow")
+    c.create_oval(1, 1, size - 1, size - 1, fill="#4a4a4a", outline="#4a4a4a")
+    c.create_oval(3, 3, size - 3, size - 3, fill="#e6b422", outline="#c99a12")
+    c.create_text(size // 2, size // 2 + 1, text="i",
+                  font=("Georgia", 10, "bold"), fill="#1e1e1e")
+    Tooltip(c, text)
+    return c
+
+
+MARKER_TIP = ("Marker key. Press it while recording to drop a numbered "
+              "marker: MARK 1, MARK 2... shows in the overlay and is "
+              "written to the log with the exact time (and OBS's recording "
+              "time, if OBS sync is on). Press it at the start of each "
+              "thing you want to measure.")
+RECORD_TIP = ("Record key. Starts or stops OBS recording without switching "
+              "to OBS, and logs when it happened. Needs OBS sync turned on "
+              "and a working Test OBS; without that, pressing it just logs "
+              "a note.")
+
+
 def build_settings_gui(cfg):
     """Shows the Input_Catcher_3000 settings window. Blocks until the user
     clicks Start Overlay or closes the window. Returns the edited cfg
@@ -716,7 +820,12 @@ def build_settings_gui(cfg):
 
     def refresh_preview():
         global FONT, PANEL_W, BOX_FILL, FG_RGB
-        apply_layout(research_var.get())
+        apply_layout(research_var.get(), {
+            "font_path": state["font_path"],
+            "marker_hotkey": marker_var.get(),
+            "record_hotkey": record_var.get(),
+            "obs_sync": obs_var.get(),
+        })
         FONT = load_font(state["font_path"])
         BOX_FILL = tuple(box_rgb) + (box_alpha,)
         FG_RGB = tuple(text_rgb)
@@ -864,13 +973,24 @@ def build_settings_gui(cfg):
                    variable=research_var, command=on_research_toggle,
                    **CHK).grid(row=0, column=0, columnspan=3, sticky="w")
     tk.Label(rf, text="Marker key:", **LBL).grid(row=1, column=0, sticky="w")
-    marker_menu = tk.OptionMenu(rf, marker_var, *research.FKEY_NAMES)
+    # Dropdown + info badge sit together in one small frame so the badge
+    # is right beside the thing it explains, not out in the next column.
+    marker_row = tk.Frame(rf, bg="#1e1e1e")
+    marker_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=1)
+    marker_menu = tk.OptionMenu(marker_row, marker_var, *research.FKEY_NAMES)
     marker_menu.configure(width=4)
-    marker_menu.grid(row=1, column=1, sticky="w", pady=1)
+    marker_menu.pack(side="left")
+    info_icon(marker_row, MARKER_TIP).pack(side="left", padx=(6, 0))
     tk.Label(rf, text="Record key:", **LBL).grid(row=2, column=0, sticky="w")
-    record_menu = tk.OptionMenu(rf, record_var, *research.FKEY_NAMES)
+    record_row = tk.Frame(rf, bg="#1e1e1e")
+    record_row.grid(row=2, column=1, columnspan=2, sticky="w", pady=1)
+    record_menu = tk.OptionMenu(record_row, record_var, *research.FKEY_NAMES)
     record_menu.configure(width=4)
-    record_menu.grid(row=2, column=1, sticky="w", pady=1)
+    record_menu.pack(side="left")
+    info_icon(record_row, RECORD_TIP).pack(side="left", padx=(6, 0))
+    # The preview's header hint mirrors these choices live.
+    for v in (marker_var, record_var, obs_var):
+        v.trace_add("write", lambda *_: refresh_preview())
     tk.Label(rf, text="Log folder:", **LBL).grid(row=3, column=0, sticky="w")
     log_dir_label = tk.Label(
         rf, text=state["research_log_dir"] or "research_logs (next to the exe)",
@@ -960,7 +1080,7 @@ if __name__ == "__main__":
             sys.exit(0)
         save_config(result_cfg)
 
-    apply_layout(bool(result_cfg.get("research_mode")))
+    apply_layout(bool(result_cfg.get("research_mode")), result_cfg)
     FONT = load_font(result_cfg.get("font_path", ""))
     BOX_FILL = tuple(result_cfg["box_color"])
     FG_RGB = tuple(result_cfg["text_color"])
