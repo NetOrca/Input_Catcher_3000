@@ -247,7 +247,10 @@ class VoiceSession:
         t0 = time.time()
         try:
             segments, _info = self._model.transcribe(
-                audio, language="en", beam_size=1, vad_filter=True)
+                audio, language="en", beam_size=1, vad_filter=False)
+            # vad_filter=True needs onnxruntime (Silero VAD), which failed
+            # inside the packaged exe on 2026-09-12 ("onnx runtime error",
+            # nothing heard). Off until the feature is revisited.
             text = " ".join(s.text.strip() for s in segments).strip()
         except Exception as e:  # noqa: BLE001
             self._set("error", "transcribe: %s" % str(e)[:50], 5.0)

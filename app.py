@@ -867,8 +867,17 @@ def build_settings_gui(cfg):
 
     root = tk.Tk()
     root.title(SETTINGS_TITLE)
-    root.resizable(False, False)
+    root.resizable(True, True)
+    root.minsize(420, 360)
     root.configure(bg="#1e1e1e")
+
+    # Voice mode is parked: the code stays, the section is hidden unless
+    # "show_voice_section": true is put in the config by hand, and voice
+    # never starts while hidden. (Parked 2026-09-12 after an onnxruntime
+    # failure in the packaged build; revisit later.)
+    show_voice = bool(cfg.get("show_voice_section"))
+    if not show_voice:
+        cfg["voice_mode"] = False
 
     box_rgb = list(cfg["box_color"][:3])
     box_alpha = cfg["box_color"][3] if len(cfg["box_color"]) > 3 else 150
@@ -956,8 +965,36 @@ def build_settings_gui(cfg):
             close_status_label.configure(text="No running instance found.")
 
     LBL = {"bg": "#1e1e1e", "fg": "#e8e8e8", "font": ("Segoe UI", 9)}
-    top = tk.Frame(root, padx=18, pady=16, bg="#1e1e1e")
-    top.pack()
+
+    # Layout: a fixed button bar pinned to the bottom (Start Overlay can
+    # never scroll off screen again), and everything else in a scrollable
+    # body. The window is resizable; if it's shorter than the content, a
+    # scrollbar and the mouse wheel take over.
+    bottom = tk.Frame(root, padx=18, pady=10, bg="#1e1e1e")
+    bottom.pack(side="bottom", fill="x")
+    body = tk.Frame(root, bg="#1e1e1e")
+    body.pack(side="top", fill="both", expand=True)
+    canvas = tk.Canvas(body, bg="#1e1e1e", highlightthickness=0, bd=0)
+    vbar = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vbar.set)
+    vbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    top = tk.Frame(canvas, padx=18, pady=16, bg="#1e1e1e")
+    top_id = canvas.create_window((0, 0), window=top, anchor="nw")
+
+    def _on_body_configure(_e=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(e):
+        canvas.itemconfigure(top_id, width=max(e.width, top.winfo_reqwidth()))
+
+    def _on_wheel(e):
+        if canvas.bbox("all") and canvas.bbox("all")[3] > canvas.winfo_height():
+            canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+    top.bind("<Configure>", _on_body_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    root.bind_all("<MouseWheel>", _on_wheel)
 
     preview_label = tk.Label(top, bg="#1e1e1e")
 
@@ -1100,7 +1137,8 @@ def build_settings_gui(cfg):
 
     vf = tk.LabelFrame(top, text=" Voice to Claude ", bg="#1e1e1e", fg="#e8e8e8",
                        font=("Segoe UI", 9, "bold"), padx=10, pady=6)
-    vf.grid(row=8, column=0, columnspan=2, sticky="we", pady=(10, 0))
+    if show_voice:
+        vf.grid(row=8, column=0, columnspan=2, sticky="we", pady=(10, 0))
     tk.Checkbutton(vf, text="Enable (press the voice key, talk, press it again to send)",
                    variable=voice_var, command=on_voice_toggle,
                    **CHK).grid(row=0, column=0, columnspan=3, sticky="w")
@@ -1122,23 +1160,28 @@ def build_settings_gui(cfg):
     voice_key_var.trace_add("write", lambda *_: refresh_preview())
     on_voice_toggle()
 
-    tk.Button(top, text="Start Overlay", font=("Segoe UI", 10, "bold"),
+    tk.Button(bottom, text="Start Overlay", font=("Segoe UI", 10, "bold"),
               bg="#2d7d46", fg="white", activebackground="#358a4f",
-              command=start_clicked).grid(
-        row=9, column=0, columnspan=2, pady=(18, 0), sticky="we")
+              command=start_clicked).pack(fill="x")
 
     # Manual escape hatch: normally Start Overlay closes any leftover
     # instance on its own, but this gives a visible, no-questions-asked
     # way to clear a stuck one (a different PC/Windows build behaving
     # differently, security software blocking the message, etc.) without
     # ever touching Task Manager.
-    tk.Button(top, text="Close All Instances", font=("Segoe UI", 9),
-              command=close_all_clicked).grid(
-        row=10, column=0, columnspan=2, pady=(8, 0), sticky="we")
-    close_status_label = tk.Label(top, text="", **LBL)
-    close_status_label.grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    tk.Button(bottom, text="Close All Instances", font=("Segoe UI", 9),
+              command=close_all_clicked).pack(fill="x", pady=(8, 0))
+    close_status_label = tk.Label(bottom, text="", **LBL)
+    close_status_label.pack(anchor="w", pady=(4, 0))
 
     refresh_preview()
+    # Open at natural size, but never taller than the screen; the body
+    # scrolls if it has to.
+    root.update_idletasks()
+    want_w = top.winfo_reqwidth() + vbar.winfo_reqwidth() + 4
+    want_h = top.winfo_reqheight() + bottom.winfo_reqheight() + 4
+    max_h = root.winfo_screenheight() - 120
+    root.geometry("%dx%d+60+40" % (want_w, min(want_h, max_h)))
     root.mainloop()
 
     if not state["started"]:
@@ -1160,7 +1203,7 @@ def build_settings_gui(cfg):
         "obs_sync": bool(obs_var.get()),
         "obs_port": obs_port,
         "obs_password": obs_pw_var.get(),
-        "voice_mode": bool(voice_var.get()),
+        "voice_mode": bool(voice_var.get()) and show_voice,
         "voice_hotkey": voice_key_var.get(),
         "voice_send_enter": bool(voice_enter_var.get()),
         "voice_target_title": voice_title_var.get().strip() or "Claude",
@@ -1179,6 +1222,8 @@ if __name__ == "__main__":
     close_existing_overlay()
 
     saved_cfg = load_config()
+    if not saved_cfg.get("show_voice_section"):
+        saved_cfg["voice_mode"] = False  # parked feature, see build_settings_gui
     if "--no-gui" in sys.argv:
         # Skip the settings screen and start straight from the saved
         # config -- for shortcuts/scripts that launch it alongside OBS,
