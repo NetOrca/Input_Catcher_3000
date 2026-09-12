@@ -11,7 +11,14 @@
     255
   ],
   "font_path": "",
-  "research_mode": false,
+  "research_mode": true,
+  "research_log_dir": "",
+  "marker_hotkey": "F8",
+  "record_hotkey": "F9",
+  "marker_prefix": "trial",
+  "mouse_sample_hz": 60,
   "obs_sync": false,
-  "obs_password": ""
+  "obs_host": "127.0.0.1",
+  "obs_port": 4455,
+  "obs_password": "0K26ZUyjpVHYulnK"
 }

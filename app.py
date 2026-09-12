@@ -950,6 +950,11 @@ def build_settings_gui(cfg):
         def poll():
             if "text" in result:
                 obs_status_label.configure(text=result["text"])
+                if result["text"].startswith("OK") and not obs_var.get():
+                    # A working connection is the only reason to run the
+                    # test -- turn sync on so the user doesn't Start with
+                    # the box still unticked and wonder why F9 is dead.
+                    obs_var.set(True)
             else:
                 root.after(100, poll)
 
